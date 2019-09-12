@@ -198,45 +198,68 @@ int get_num_procs(void);
 #else
 int get_num_procs(void) {
   static int nums = 0;
-cpu_set_t *cpusetp;
-size_t size;
-int ret;
-int i,n;
+  cpu_set_t cpuset,*cpusetp;
+  size_t size;
+  int ret;
+
+#if defined(__GLIBC_PREREQ)
+#if !__GLIBC_PREREQ(2, 7)
+  int i;
+#if !__GLIBC_PREREQ(2, 6)
+  int n;
+#endif
+#endif
+#endif
 
   if (!nums) nums = sysconf(_SC_NPROCESSORS_CONF);
 #if !defined(OS_LINUX)
-     return nums;
+  return nums;
 #endif
 
 #if !defined(__GLIBC_PREREQ)
-   return nums;
+  return nums;
 #else
  #if !__GLIBC_PREREQ(2, 3)
-   return nums;
+  return nums;
  #endif
 
  #if !__GLIBC_PREREQ(2, 7)
-  ret = sched_getaffinity(0,sizeof(cpu_set_t), cpusetp);
+  ret = sched_getaffinity(0,sizeof(cpuset), &cpuset);
   if (ret!=0) return nums;
   n=0;
   #if !__GLIBC_PREREQ(2, 6)
   for (i=0;i<nums;i++)
-     if (CPU_ISSET(i,cpusetp)) n++;
+     if (CPU_ISSET(i,&cpuset)) n++;
   nums=n;
   #else
-  nums = CPU_COUNT(sizeof(cpu_set_t),cpusetp);
+  nums = CPU_COUNT(sizeof(cpuset),&cpuset);
   #endif
   return nums;
  #else
-  cpusetp = CPU_ALLOC(nums);
-  if (cpusetp == NULL) return nums;
-  size = CPU_ALLOC_SIZE(nums);
-  ret = sched_getaffinity(0,size,cpusetp);
-  if (ret!=0) return nums;
-  ret = CPU_COUNT_S(size,cpusetp);
-  if (ret > 0 && ret < nums) nums = ret;
-  CPU_FREE(cpusetp);
-  return nums;
+  if (nums >= CPU_SETSIZE) {
+    cpusetp = CPU_ALLOC(nums);
+      if (cpusetp == NULL) {
+        return nums;
+      }
+    size = CPU_ALLOC_SIZE(nums);
+    ret = sched_getaffinity(0,size,cpusetp);
+    if (ret!=0) {
+      CPU_FREE(cpusetp);
+      return nums;
+    }
+    ret = CPU_COUNT_S(size,cpusetp);
+    if (ret > 0 && ret < nums) nums = ret;	
+    CPU_FREE(cpusetp);
+    return nums;
+  } else {
+    ret = sched_getaffinity(0,sizeof(cpuset),&cpuset);
+    if (ret!=0) {
+      return nums;
+    }
+    ret = CPU_COUNT(&cpuset);
+    if (ret > 0 && ret < nums) nums = ret;	
+    return nums;
+  }
  #endif
 #endif
 }
@@ -1073,11 +1096,6 @@ static volatile int memory_initialized = 0;
     }
     free(table);
   }
-#if defined(OS_WINDOWS)
-  TlsFree(local_storage_key);
-#else
-  pthread_key_delete(local_storage_key);
-#endif		
 }
 
 static void blas_memory_init(){
@@ -1295,6 +1313,13 @@ void blas_memory_free_nolock(void * map_address) {
   free(map_address);
 }
 
+#ifdef SMP
+void blas_thread_memory_cleanup(void) {
+    blas_memory_cleanup((void*)get_memory_table());
+}
+#endif
+
+
 void blas_shutdown(void){
 #ifdef SMP
   BLASFUNC(blas_thread_shutdown)();
@@ -1304,7 +1329,7 @@ void blas_shutdown(void){
   /* Only cleanupIf we were built for threading and TLS was initialized */
   if (local_storage_key)
 #endif
-    blas_memory_cleanup((void*)get_memory_table());
+    blas_thread_memory_cleanup();
 
 #ifdef SEEK_ADDRESS
   base_address      = 0UL;
@@ -1491,6 +1516,14 @@ void DESTRUCTOR gotoblas_quit(void) {
 
   blas_shutdown();
 
+#if defined(SMP)
+#if defined(OS_WINDOWS)
+  TlsFree(local_storage_key);
+#else
+  pthread_key_delete(local_storage_key);
+#endif		
+#endif
+
 #ifdef PROFILE
    moncontrol (0);
 #endif
@@ -1526,7 +1559,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD  ul_reason_for_call, LPVOID lpReser
       break;
     case DLL_THREAD_DETACH:
 #if defined(SMP)
-      blas_memory_cleanup((void*)get_memory_table());
+      blas_thread_memory_cleanup();
 #endif
       break;
     case DLL_PROCESS_DETACH:
@@ -1589,6 +1622,7 @@ void gotoblas_dummy_for_PGI(void) {
   gotoblas_init();
   gotoblas_quit();
 
+#if __PGIC__ < 19
 #if 0
   asm ("\t.section\t.ctors,\"aw\",@progbits; .align 8; .quad gotoblas_init; .section .text");
   asm ("\t.section\t.dtors,\"aw\",@progbits; .align 8; .quad gotoblas_quit; .section .text");
@@ -1596,13 +1630,16 @@ void gotoblas_dummy_for_PGI(void) {
   asm (".section .init,\"ax\"; call gotoblas_init@PLT; .section .text");
   asm (".section .fini,\"ax\"; call gotoblas_quit@PLT; .section .text");
 #endif
+#endif
 }
 #endif
 
 #else
+/* USE_TLS / COMPILE_TLS not set */
+
 #include <errno.h>
 
-#ifdef OS_WINDOWS
+#if defined(OS_WINDOWS) && !defined(OS_CYGWIN_NT)
 #define ALLOC_WINDOWS
 #ifndef MEM_LARGE_PAGES
 #define MEM_LARGE_PAGES  0x20000000
@@ -1616,7 +1653,7 @@ void gotoblas_dummy_for_PGI(void) {
 #include <stdio.h>
 #include <fcntl.h>
 
-#ifndef OS_WINDOWS
+#if !defined(OS_WINDOWS) || defined(OS_CYGWIN_NT)
 #include <sys/mman.h>
 #ifndef NO_SYSV_IPC
 #include <sys/shm.h>
@@ -1636,7 +1673,7 @@ void gotoblas_dummy_for_PGI(void) {
 #include <sys/resource.h>
 #endif
 
-#if defined(OS_FREEBSD) || defined(OS_DARWIN)
+#if defined(OS_FREEBSD) || defined(OS_OPENBSD) || defined(OS_DRAGONFLY) || defined(OS_DARWIN)
 #include <sys/sysctl.h>
 #include <sys/resource.h>
 #endif
@@ -1675,9 +1712,12 @@ void gotoblas_dummy_for_PGI(void) {
 #elif (defined(OS_DARWIN) || defined(OS_SUNOS)) && defined(C_GCC)
 #define CONSTRUCTOR	__attribute__ ((constructor))
 #define DESTRUCTOR	__attribute__ ((destructor))
-#else
+#elif __GNUC__ && INIT_PRIORITY && ((GCC_VERSION >= 40300) || (CLANG_VERSION >= 20900))
 #define CONSTRUCTOR	__attribute__ ((constructor(101)))
 #define DESTRUCTOR	__attribute__ ((destructor(101)))
+#else
+#define CONSTRUCTOR	__attribute__ ((constructor))
+#define DESTRUCTOR	__attribute__ ((destructor))
 #endif
 
 #ifdef DYNAMIC_ARCH
@@ -1701,45 +1741,70 @@ void goto_set_num_threads(int num_threads) {};
 int get_num_procs(void);
 #else
 int get_num_procs(void) {
+
   static int nums = 0;
-cpu_set_t *cpusetp;
-size_t size;
-int ret;
-int i,n;
+  cpu_set_t cpuset,*cpusetp;
+  size_t size;
+  int ret;
+
+#if defined(__GLIBC_PREREQ)
+#if !__GLIBC_PREREQ(2, 7)
+  int i;
+#if !__GLIBC_PREREQ(2, 6)
+  int n;
+#endif
+#endif
+#endif
 
   if (!nums) nums = sysconf(_SC_NPROCESSORS_CONF);
 #if !defined(OS_LINUX)
-     return nums;
+  return nums;
 #endif
 
 #if !defined(__GLIBC_PREREQ)
-   return nums;
+  return nums;
 #else
  #if !__GLIBC_PREREQ(2, 3)
-   return nums;
+  return nums;
  #endif
 
  #if !__GLIBC_PREREQ(2, 7)
-  ret = sched_getaffinity(0,sizeof(cpu_set_t), cpusetp);
+  ret = sched_getaffinity(0,sizeof(cpuset), &cpuset);
   if (ret!=0) return nums;
   n=0;
   #if !__GLIBC_PREREQ(2, 6)
   for (i=0;i<nums;i++)
-     if (CPU_ISSET(i,cpusetp)) n++;
+     if (CPU_ISSET(i,&cpuset)) n++;
   nums=n;
   #else
-  nums = CPU_COUNT(sizeof(cpu_set_t),cpusetp);
+  nums = CPU_COUNT(sizeof(cpuset),&cpuset);
   #endif
   return nums;
  #else
-  cpusetp = CPU_ALLOC(nums);
-  if (cpusetp == NULL) return nums;
-  size = CPU_ALLOC_SIZE(nums);
-  ret = sched_getaffinity(0,size,cpusetp);
-  if (ret!=0) return nums;
-  nums = CPU_COUNT_S(size,cpusetp);
-  CPU_FREE(cpusetp);
-  return nums;
+  if (nums >= CPU_SETSIZE) {
+    cpusetp = CPU_ALLOC(nums);
+      if (cpusetp == NULL) {
+        return nums;
+      }
+    size = CPU_ALLOC_SIZE(nums);
+    ret = sched_getaffinity(0,size,cpusetp);
+    if (ret!=0) {
+      CPU_FREE(cpusetp);
+      return nums;
+    }
+    ret = CPU_COUNT_S(size,cpusetp);
+    if (ret > 0 && ret < nums) nums = ret;	
+    CPU_FREE(cpusetp);
+    return nums;
+  } else {
+    ret = sched_getaffinity(0,sizeof(cpuset),&cpuset);
+    if (ret!=0) {
+      return nums;
+    }
+    ret = CPU_COUNT(&cpuset);
+    if (ret > 0 && ret < nums) nums = ret;	
+    return nums;
+  }
  #endif
 #endif
 }
@@ -1753,7 +1818,7 @@ int get_num_procs(void) {
   return nums;
 }
 #endif
-	
+
 #ifdef OS_HAIKU
 int get_num_procs(void) {
   static int nums = 0;
@@ -1790,7 +1855,7 @@ int get_num_procs(void) {
 
 #endif
 
-#if defined(OS_FREEBSD)
+#if defined(OS_FREEBSD) || defined(OS_OPENBSD) || defined(OS_DRAGONFLY)
 
 int get_num_procs(void) {
 
@@ -1867,7 +1932,7 @@ void openblas_fork_handler()
   //   http://gcc.gnu.org/bugzilla/show_bug.cgi?id=60035
   // In the mean time build with USE_OPENMP=0 or link against another
   // implementation of OpenMP.
-#if !(defined(OS_WINDOWS) || defined(OS_ANDROID)) && defined(SMP_SERVER)
+#if !((defined(OS_WINDOWS) && !defined(OS_CYGWIN_NT)) || defined(OS_ANDROID)) && defined(SMP_SERVER)
   int err;
   err = pthread_atfork ((void (*)(void)) BLASFUNC(blas_thread_shutdown), NULL, NULL);
   if(err != 0)
@@ -1880,7 +1945,7 @@ extern int openblas_goto_num_threads_env();
 extern int openblas_omp_num_threads_env();
 
 int blas_get_cpu_number(void){
-#if defined(OS_LINUX) || defined(OS_WINDOWS) || defined(OS_FREEBSD) || defined(OS_DARWIN) || defined(OS_ANDROID)
+#if defined(OS_LINUX) || defined(OS_WINDOWS) || defined(OS_FREEBSD) || defined(OS_OPENBSD) || defined(OS_DRAGONFLY) || defined(OS_DARWIN) || defined(OS_ANDROID)
   int max_num;
 #endif
   int blas_goto_num   = 0;
@@ -1888,11 +1953,11 @@ int blas_get_cpu_number(void){
 
   if (blas_num_threads) return blas_num_threads;
 
-#if defined(OS_LINUX) || defined(OS_WINDOWS) || defined(OS_FREEBSD) || defined(OS_DARWIN) || defined(OS_ANDROID)
+#if defined(OS_LINUX) || defined(OS_WINDOWS) || defined(OS_FREEBSD) || defined(OS_OPENBSD) || defined(OS_DRAGONFLY) || defined(OS_DARWIN) || defined(OS_ANDROID)
   max_num = get_num_procs();
 #endif
 
-  blas_goto_num = 0;
+  // blas_goto_num = 0;
 #ifndef USE_OPENMP
   blas_goto_num=openblas_num_threads_env();
   if (blas_goto_num < 0) blas_goto_num = 0;
@@ -1904,7 +1969,7 @@ int blas_get_cpu_number(void){
 
 #endif
 
-  blas_omp_num = 0;
+  // blas_omp_num = 0;
   blas_omp_num=openblas_omp_num_threads_env();
   if (blas_omp_num < 0) blas_omp_num = 0;
 
@@ -1912,7 +1977,7 @@ int blas_get_cpu_number(void){
   else if (blas_omp_num > 0) blas_num_threads = blas_omp_num;
   else blas_num_threads = MAX_CPU_NUMBER;
 
-#if defined(OS_LINUX) || defined(OS_WINDOWS) || defined(OS_FREEBSD) || defined(OS_DARWIN) || defined(OS_ANDROID)
+#if defined(OS_LINUX) || defined(OS_WINDOWS) || defined(OS_FREEBSD) || defined(OS_OPENBSD) || defined(OS_DRAGONFLY) || defined(OS_DARWIN) || defined(OS_ANDROID)
   if (blas_num_threads > max_num) blas_num_threads = max_num;
 #endif
 
@@ -1976,8 +2041,12 @@ static BLASULONG  alloc_lock = 0UL;
 
 static void alloc_mmap_free(struct release_t *release){
 
+if (!release->address) return;
+
   if (munmap(release -> address, BUFFER_SIZE)) {
-    printf("OpenBLAS : munmap failed\n");
+      int errsv=errno;
+       perror("OpenBLAS : munmap failed:");
+       printf("error code=%d,\trelease->address=%lx\n",errsv,release->address);
   }
 }
 
@@ -1999,11 +2068,21 @@ static void *alloc_mmap(void *address){
   }
 
   if (map_address != (void *)-1) {
+#if (defined(SMP) || defined(USE_LOCKING)) && !defined(USE_OPENMP)
     LOCK_COMMAND(&alloc_lock);
+#endif    
     release_info[release_pos].address = map_address;
     release_info[release_pos].func    = alloc_mmap_free;
     release_pos ++;
+#if (defined(SMP) || defined(USE_LOCKING)) && !defined(USE_OPENMP)
     UNLOCK_COMMAND(&alloc_lock);
+#endif    
+  } else {
+#ifdef DEBUG  
+        int errsv=errno;
+       perror("OpenBLAS : mmap failed:");
+       printf("error code=%d,\tmap_address=%lx\n",errsv,map_address);
+#endif
   }
 
 #ifdef OS_LINUX
@@ -2145,14 +2224,18 @@ static void *alloc_mmap(void *address){
 #if defined(OS_LINUX) && !defined(NO_WARMUP)
   }
 #endif
-  LOCK_COMMAND(&alloc_lock);
 
   if (map_address != (void *)-1) {
+#if (defined(SMP) || defined(USE_LOCKING)) && !defined(USE_OPENMP)
+    LOCK_COMMAND(&alloc_lock);
+#endif
     release_info[release_pos].address = map_address;
     release_info[release_pos].func    = alloc_mmap_free;
     release_pos ++;
+#if (defined(SMP) || defined(USE_LOCKING)) && !defined(USE_OPENMP)
+    UNLOCK_COMMAND(&alloc_lock);
+#endif
   }
-  UNLOCK_COMMAND(&alloc_lock);
 
   return map_address;
 }
@@ -2520,7 +2603,7 @@ void *blas_memory_alloc(int procpos){
 
   int position;
 #if defined(WHEREAMI) && !defined(USE_OPENMP)
-  int mypos;
+  int mypos = 0;
 #endif
 
   void *map_address;
@@ -2551,6 +2634,11 @@ void *blas_memory_alloc(int procpos){
     NULL,
   };
   void *(**func)(void *address);
+
+#if defined(USE_OPENMP)
+  if (!memory_initialized) {
+#endif
+
   LOCK_COMMAND(&alloc_lock);
 
   if (!memory_initialized) {
@@ -2586,6 +2674,9 @@ void *blas_memory_alloc(int procpos){
 
   }
   UNLOCK_COMMAND(&alloc_lock);
+#if defined(USE_OPENMP)
+  }
+#endif
 
 #ifdef DEBUG
   printf("Alloc Start ...\n");
@@ -2600,13 +2691,17 @@ void *blas_memory_alloc(int procpos){
 
   do {
     if (!memory[position].used && (memory[position].pos == mypos)) {
+#if defined(SMP) && !defined(USE_OPENMP)
       LOCK_COMMAND(&alloc_lock);
-//      blas_lock(&memory[position].lock);
-
+#else      
+      blas_lock(&memory[position].lock);
+#endif
       if (!memory[position].used) goto allocation;
-
+#if defined(SMP) && !defined(USE_OPENMP)
       UNLOCK_COMMAND(&alloc_lock);
-//      blas_unlock(&memory[position].lock);
+#else
+      blas_unlock(&memory[position].lock);
+#endif      
     }
 
     position ++;
@@ -2618,21 +2713,26 @@ void *blas_memory_alloc(int procpos){
 
   position = 0;
 
+#if (defined(SMP) || defined(USE_LOCKING)) && !defined(USE_OPENMP)
   LOCK_COMMAND(&alloc_lock);
+#endif
   do {
-/*    if (!memory[position].used) { */
-/*      blas_lock(&memory[position].lock);*/
-
+#if defined(USE_OPENMP)	  
+    if (!memory[position].used) { 
+      blas_lock(&memory[position].lock);
+#endif
       if (!memory[position].used) goto allocation;
       
-/*      blas_unlock(&memory[position].lock);*/
-/*    } */
-
+#if defined(USE_OPENMP)
+      blas_unlock(&memory[position].lock);      
+    }
+#endif
     position ++;
 
   } while (position < NUM_BUFFERS);
-  UNLOCK_COMMAND(&alloc_lock);
-
+#if (defined(SMP) || defined(USE_LOCKING)) && !defined(USE_OPENMP)
+  UNLOCK_COMMAND(&alloc_lock);	
+#endif
   goto error;
 
   allocation :
@@ -2642,10 +2742,11 @@ void *blas_memory_alloc(int procpos){
 #endif
 
   memory[position].used = 1;
-
+#if (defined(SMP) || defined(USE_LOCKING)) && !defined(USE_OPENMP)
   UNLOCK_COMMAND(&alloc_lock);
-/*  blas_unlock(&memory[position].lock);*/
-
+#else
+  blas_unlock(&memory[position].lock);	
+#endif
   if (!memory[position].addr) {
     do {
 #ifdef DEBUG
@@ -2662,7 +2763,7 @@ void *blas_memory_alloc(int procpos){
 
 #ifdef ALLOC_DEVICEDRIVER
 	if ((*func ==  alloc_devicedirver) && (map_address == (void *)-1)) {
-	    fprintf(stderr, "OpenBLAS Warning ... Physically contigous allocation was failed.\n");
+	    fprintf(stderr, "OpenBLAS Warning ... Physically contiguous allocation was failed.\n");
 	}
 #endif
 
@@ -2690,9 +2791,13 @@ void *blas_memory_alloc(int procpos){
 
     } while ((BLASLONG)map_address == -1);
 
+#if (defined(SMP) || defined(USE_LOCKING)) && !defined(USE_OPENMP)
     LOCK_COMMAND(&alloc_lock);
+#endif    
     memory[position].addr = map_address;
+#if (defined(SMP) || defined(USE_LOCKING)) && !defined(USE_OPENMP)
     UNLOCK_COMMAND(&alloc_lock);
+#endif
 
 #ifdef DEBUG
     printf("  Mapping Succeeded. %p(%d)\n", (void *)memory[position].addr, position);
@@ -2746,8 +2851,9 @@ void blas_memory_free(void *free_area){
 #endif
 
   position = 0;
+#if (defined(SMP) || defined(USE_LOCKING)) && !defined(USE_OPENMP)
   LOCK_COMMAND(&alloc_lock);
-
+#endif
   while ((position < NUM_BUFFERS) && (memory[position].addr != free_area))
     position++;
 
@@ -2761,7 +2867,9 @@ void blas_memory_free(void *free_area){
   WMB;
 
   memory[position].used = 0;
+#if (defined(SMP) || defined(USE_LOCKING)) && !defined(USE_OPENMP)
   UNLOCK_COMMAND(&alloc_lock);
+#endif
 
 #ifdef DEBUG
   printf("Unmap Succeeded.\n\n");
@@ -2776,8 +2884,9 @@ void blas_memory_free(void *free_area){
   for (position = 0; position < NUM_BUFFERS; position++)
     printf("%4ld  %p : %d\n", position, memory[position].addr, memory[position].used);
 #endif
+#if (defined(SMP) || defined(USE_LOCKING)) && !defined(USE_OPENMP)
   UNLOCK_COMMAND(&alloc_lock);
-
+#endif
   return;
 }
 
@@ -2827,7 +2936,7 @@ void blas_shutdown(void){
 
 #if defined(OS_LINUX) && !defined(NO_WARMUP)
 
-#ifdef SMP
+#if defined(SMP) || defined(USE_LOCKING)
 #if   defined(USE_PTHREAD_LOCK)
 static pthread_mutex_t    init_lock = PTHREAD_MUTEX_INITIALIZER;
 #elif defined(USE_PTHREAD_SPINLOCK)
@@ -2852,7 +2961,7 @@ static void _touch_memory(blas_arg_t *arg, BLASLONG *range_m, BLASLONG *range_n,
     if (hot_alloc != 2) {
 #endif
 
-#ifdef SMP
+#if defined(SMP) || defined(USE_LOCKING)
   LOCK_COMMAND(&init_lock);
 #endif
 
@@ -2862,7 +2971,7 @@ static void _touch_memory(blas_arg_t *arg, BLASLONG *range_m, BLASLONG *range_n,
     size    -= PAGESIZE;
   }
 
-#ifdef SMP
+#if defined(SMP) || defined(USE_LOCKING)
   UNLOCK_COMMAND(&init_lock);
 #endif
 
@@ -3095,7 +3204,7 @@ void gotoblas_dummy_for_PGI(void) {
 
   gotoblas_init();
   gotoblas_quit();
-
+#if __PGIC__ < 19
 #if 0
   asm ("\t.section\t.ctors,\"aw\",@progbits; .align 8; .quad gotoblas_init; .section .text");
   asm ("\t.section\t.dtors,\"aw\",@progbits; .align 8; .quad gotoblas_quit; .section .text");
@@ -3103,6 +3212,7 @@ void gotoblas_dummy_for_PGI(void) {
   asm (".section .init,\"ax\"; call gotoblas_init@PLT; .section .text");
   asm (".section .fini,\"ax\"; call gotoblas_quit@PLT; .section .text");
 #endif
+#endif	
 }
 #endif
 
