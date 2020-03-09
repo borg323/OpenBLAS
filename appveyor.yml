@@ -10,10 +10,10 @@ install:
 - cmd: set PATH=C:\Python36;C:\Python36\scripts;%PATH%
 - cmd: IF %NAME%==android-aarch64 C:\ProgramData\Microsoft\AndroidNDK64\android-ndk-r17\build\tools\make_standalone_toolchain.py --arch arm64 --api 21 --stl libc++ --install-dir \android-standalone-64
 - cmd: IF %NAME%==android-aarch64 set PATH=C:\android-standalone-64\bin;%PATH%
-- cmd: IF %NAME%==android-armv7a C:\ProgramData\Microsoft\AndroidNDK64\android-ndk-r17\build\tools\make_standalone_toolchain.py --arch arm --api 24 --stl libc++ --install-dir \android-standalone-32
+- cmd: IF %NAME%==android-armv7a C:\ProgramData\Microsoft\AndroidNDK64\android-ndk-r17\build\tools\make_standalone_toolchain.py --arch arm --api 21 --stl libc++ --install-dir \android-standalone-32
 - cmd: IF %NAME%==android-armv7a set PATH=C:\android-standalone-32\bin;%PATH%
 build_script:
-- cmd: IF %NAME%==android-armv7a bash -xlc "make TARGET=ARMV7 ARM_SOFTFP_ABI=1 HOSTCC=gcc CC=arm-linux-androideabi-gcc CFLAGS=-march=armv7-a NOFORTRAN=1 NO_SHARED=1"
+- cmd: IF %NAME%==android-armv7a bash -xlc "make TARGET=ARMV7 ARM_SOFTFP_ABI=1 HOSTCC=gcc CC=arm-linux-androideabi-gcc CFLAGS='-march=armv7-a -D__ANDROID_API__=21' NOFORTRAN=1 NO_SHARED=1"
 - cmd: IF %NAME%==android-aarch64 bash -xlc "make TARGET=ARMV8 BINARY=64 HOSTCC=gcc CC=aarch64-linux-android-gcc CFLAGS=-D__ANDROID_API__=21 NOFORTRAN=1 NO_SHARED=1"
 - cmd: bash -xlc "make PREFIX=./install/%NAME% NO_SHARED=1 install"
 after_build:
